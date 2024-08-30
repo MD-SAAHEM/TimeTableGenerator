@@ -1,0 +1,37 @@
+CREATE TABLE UniqueCourses (
+    course_id VARCHAR(10) PRIMARY KEY,
+    course_name VARCHAR(100) NOT NULL
+);
+CREATE TABLE CoursePrograms (
+    course_id VARCHAR(10),
+    program_id VARCHAR(10),
+    credits INT,
+    total_hours INT,
+    FOREIGN KEY (course_id) REFERENCES UniqueCourses(course_id)
+);
+CREATE TABLE Faculty (
+    faculty_id VARCHAR(10) PRIMARY KEY,
+    faculty_name VARCHAR(100) NOT NULL,
+    specialization VARCHAR(100)
+);
+CREATE TABLE Classrooms (
+    classroom_id VARCHAR(10) PRIMARY KEY,
+    capacity INT
+);
+CREATE TABLE Timetable (
+    timetable_id SERIAL PRIMARY KEY,
+    program_id VARCHAR(10),
+    day VARCHAR(10),
+    period INT,
+    course_id VARCHAR(10),
+    faculty_id VARCHAR(10),
+    classroom_id VARCHAR(10),
+    FOREIGN KEY (course_id) REFERENCES UniqueCourses(course_id),
+    FOREIGN KEY (faculty_id) REFERENCES Faculty(faculty_id),
+    FOREIGN KEY (classroom_id) REFERENCES Classrooms(classroom_id)
+);
+CREATE TABLE AdditionalSessions (
+    session_id VARCHAR(10) PRIMARY KEY,
+    session_name VARCHAR(100) NOT NULL
+);
+
