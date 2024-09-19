@@ -8,6 +8,7 @@ import java.util.Set;
 public class TimetableDisplay {
 
     public static void displayTimetable() throws SQLException {
+        System.out.println("Displaying timetable...");
         Connection conn = null;
         Statement stmt = null;
         ResultSet rs = null;
@@ -18,7 +19,7 @@ public class TimetableDisplay {
             stmt = conn.createStatement();
 
             // Fetch timetable for MCAB ordered by day and period
-            String query = "SELECT * FROM Timetable WHERE program_id = 'MCAB' ORDER BY day, period";
+            String query = "SELECT * FROM Timetable WHERE program_id = 'MSCS' ORDER BY day, period";
             rs = stmt.executeQuery(query);
 
             String currentDay = "";

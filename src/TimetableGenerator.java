@@ -1,7 +1,10 @@
+import javax.xml.transform.stream.StreamSource;
 import java.sql.*;
 import java.util.*;
-
+import java.util.logging.*;
+//import TimetableDisplay;
 public class TimetableGenerator {
+    private static final Logger logger = Logger.getLogger(TimetableGenerator.class.getName());
 
     private static void generateTimetable(String programId) throws SQLException {
         Connection conn = null;
@@ -11,78 +14,132 @@ public class TimetableGenerator {
         try {
             // Load PostgreSQL JDBC Driver
             Class.forName("org.postgresql.Driver");
+            logger.info("PostgreSQL JDBC Driver loaded successfully.");
 
             // Connect to PostgreSQL database
             String url = "jdbc:postgresql://localhost:5432/timetable_management";
             String user = "postgres";
             String password = "admin";
             conn = DriverManager.getConnection(url, user, password);
-            stmt = conn.createStatement();
+            stmt = conn.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE, ResultSet.CONCUR_READ_ONLY);
 
             // Empty the Timetable table
             stmt.executeUpdate("DELETE FROM Timetable");
+            logger.info("Timetable table cleared.");
 
             // Fetch courses
             String courseQuery = "SELECT * FROM CoursePrograms WHERE program_id = '" + programId + "'";
             rsCourses = stmt.executeQuery(courseQuery);
+            logger.info("Courses fetched for program_id: " + programId);
 
             List<String> timetableSlots = defineTimetableSlots();  // Define and shuffle your slots
             Map<String, Set<String>> subjectsScheduledPerDay = new HashMap<>();
             Map<String, Integer> labSessionsPerDay = new HashMap<>();
             Map<String, Integer> periodsPerDay = new HashMap<>();
+            Map<String, Integer> allocatedHours = new HashMap<>();
 
+            // **FIRST: Allocate Hard Constraint Sessions**
+            // GE and Lab sessions are allocated before regular courses.
+            rsCourses.beforeFirst();  // Reset ResultSet pointer to the beginning
             while (rsCourses.next()) {
                 String courseId = rsCourses.getString("course_id");
                 String courseType = rsCourses.getString("course_type");
                 int totalHours = rsCourses.getInt("total_hours");
 
-                // Allocate time for GE sessions only on Mondays and Wednesdays 5th and 6th periods
-                if (isGeneralElective(courseId)) {
-                    allocateGESessions(conn, programId, courseId);
-                    continue;
-                }
+                allocatedHours.put(courseId, 0);  // Initialize allocated hours
 
                 // Allocate lab sessions
                 if ("LAB".equals(courseType)) {
+                    logger.info("Allocating lab sessions for course: " + courseId);
                     String[] labSlots = findAvailableLabSlot(timetableSlots, conn, programId, courseId, subjectsScheduledPerDay, labSessionsPerDay);
                     if (labSlots != null) {
                         insertTimetableEntry(conn, programId, courseId, labSlots);
-                        continue;
+                        allocatedHours.put(courseId, allocatedHours.get(courseId) + 2);
+                        logger.info("Lab session allocated for course: " + courseId + " in slots: " + Arrays.toString(labSlots));
+                        continue;  // Skip to the next course since Lab is allocated
                     }
                 }
 
-                // Allocate regular courses
-                for (int i = 0; i < totalHours; i++) {
-                    String slot = findAvailableSlot(timetableSlots, conn, programId, courseId, subjectsScheduledPerDay);
-                    if (slot != null) {
-                        insertTimetableEntry(conn, programId, courseId, slot);
+                // Allocate time for GE sessions only on Mondays and Wednesdays 5th and 6th periods
+                if (isGeneralElective(courseId)) {
+                    logger.info("Allocating GE sessions for course: " + courseId);
+                    allocateGESessions(conn, programId, courseId);
+                    continue;  // Skip to the next course since GE is allocated
+                }
+
+            }
+
+            // **SECOND: Allocate Normal Sessions**
+// Now, we allocate regular courses after hard constraints.
+            rsCourses.beforeFirst();  // Reset ResultSet pointer to the beginning
+            while (rsCourses.next()) {
+                String courseId = rsCourses.getString("course_id");
+                String courseType = rsCourses.getString("course_type");
+                int totalHours = rsCourses.getInt("total_hours");
+
+                // Skip already allocated GE and Lab sessions
+                if (isGeneralElective(courseId) || "LAB".equals(courseType)) {
+                    continue;  // GE and Labs are already handled
+                }
+
+                logger.info("Allocating regular sessions for course: " + courseId);
+
+                // Initialize daily allocation tracking
+                Map<String, Integer> allocatedHoursPerDay = new HashMap<>();
+                for (String day : Arrays.asList("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")) {
+                    allocatedHoursPerDay.put(day, 0);  // Initialize allocated hours for the day
+                }
+
+                // Allocate until total hours are met
+                while (allocatedHours.get(courseId) < totalHours) {
+                    boolean allocated = false; // Track if any session was allocated in this loop
+
+                    for (String day : allocatedHoursPerDay.keySet()) {
+                        if (allocatedHoursPerDay.get(day) < 7) {  // Ensure that we don't exceed 7 hours
+                            String slot = findAvailableSlotForDay(timetableSlots, conn, programId, courseId, subjectsScheduledPerDay, day);
+                            if (slot != null) {
+                                insertTimetableEntry(conn, programId, courseId, slot);
+                                allocatedHours.put(courseId, allocatedHours.get(courseId) + 1);
+                                allocatedHoursPerDay.put(day, allocatedHoursPerDay.get(day) + 1);  // Increment daily allocated hours
+                                logger.info("Course: " + courseId + " allocated on " + day + " in slot: " + slot);
+                                allocated = true; // Mark that an allocation was made
+                            } else {
+                                logger.warning("No available slots for course: " + courseId + " on " + day);
+                            }
+
+                            // Break if 7 hours for this day are filled
+                            if (allocatedHoursPerDay.get(day) >= 7) {
+                                break;
+                            }
+                        }
+                    }
+
+                    // Break the while loop if no sessions were allocated in this iteration
+                    if (!allocated) {
+                        break; // No more slots available, exit the loop
                     }
                 }
             }
 
-            // Ensure each day has exactly 7 periods
-            for (String day : new String[]{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday"}) {
-                int periods = periodsPerDay.getOrDefault(day, 0);
-                while (periods < 7) {
-                    String slot = findAvailableSlot(timetableSlots, conn, programId, "APT", subjectsScheduledPerDay);
-                    if (slot != null) {
-                        insertTimetableEntry(conn, programId, "APT", slot);
-                        periods++;
-                    }
-                }
-            }
 
-            // Allocate additional sessions (LIB, MENT, APT) once per week
-            scheduleAdditionalSessions(programId, conn);
+
+            logger.info("Timetable generation completed successfully.");
+            System.exit(0);
 
         } catch (ClassNotFoundException e) {
-            e.printStackTrace();
+            logger.log(Level.SEVERE, "JDBC Driver not found", e);
+            System.exit(1);
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "SQL Exception occurred", e);
+            System.exit(1);
         } finally {
             if (rsCourses != null) rsCourses.close();
             if (stmt != null) stmt.close();
             if (conn != null) conn.close();
+            logger.info("Database connection closed.");
         }
     }
+
 
     private static List<String> defineTimetableSlots() {
         List<String> slots = new ArrayList<>();
@@ -94,6 +151,7 @@ public class TimetableGenerator {
         }
         // Shuffle the slots to ensure different allocations on each generation
         Collections.shuffle(slots);
+        logger.info("Timetable slots defined and shuffled.");
         return slots;
     }
 
@@ -109,9 +167,8 @@ public class TimetableGenerator {
         }
     }
 
-    private static String findAvailableSlot(List<String> timetableSlots, Connection conn, String programId, String courseId, Map<String, Set<String>> subjectsScheduledPerDay) throws SQLException {
+    private static String findAvailableSlotForDay(List<String> timetableSlots, Connection conn, String programId, String courseId, Map<String, Set<String>> subjectsScheduledPerDay, String day) throws SQLException {
         for (String slot : timetableSlots) {
-            String day = slot.split(":")[0];
             int period = Integer.parseInt(slot.split(":")[1]);
 
             // Check if the subject has already been scheduled for the day
@@ -122,9 +179,11 @@ public class TimetableGenerator {
             // Check if slot is available based on constraints
             if (isSlotAvailable(conn, day, period, programId, courseId)) {
                 timetableSlots.remove(slot);
-                return slot;
+                logger.info("Available slot found: " + day + " " + period);
+                return day + ":" + period;
             }
         }
+        logger.warning("No available slots found for course: " + courseId + " on day: " + day);
         return null;
     }
 
@@ -138,142 +197,84 @@ public class TimetableGenerator {
                 continue; // Skip this slot if the subject is already scheduled for the day
             }
 
-            // Check if more than one lab session is already scheduled for the day
-            if (labSessionsPerDay.getOrDefault(day, 0) >= 1) {
-                continue; // Skip this slot if more than one lab session is already scheduled for the day
-            }
-
-            // Check if two continuous slots are available within the 7-period constraint
-            if (period < 7 && isSlotAvailable(conn, day, period, programId, courseId) && isSlotAvailable(conn, day, period + 1, programId, courseId)) {
-                timetableSlots.remove(slot);
+            // Check for consecutive available periods
+            if (isSlotAvailable(conn, day, period, programId, courseId) && isSlotAvailable(conn, day, period + 1, programId, courseId)) {
+                timetableSlots.remove(day + ":" + period);
                 timetableSlots.remove(day + ":" + (period + 1));
                 labSessionsPerDay.put(day, labSessionsPerDay.getOrDefault(day, 0) + 1);
-                return new String[]{slot, day + ":" + (period + 1)};
+                logger.info("Available lab slot found: " + day + " Periods: " + period + "," + (period + 1));
+                return new String[]{day + ":" + period, day + ":" + (period + 1)};
             }
         }
-        return null;
-    }
-
-    private static boolean isSlotAvailable(Connection conn, String day, int period, String programId, String courseId) throws SQLException {
-        try (PreparedStatement pstmt = conn.prepareStatement(
-                "SELECT COUNT(*) FROM Timetable WHERE day = ? AND period = ? AND program_id = ?")) {
-            pstmt.setString(1, day);
-            pstmt.setInt(2, period);
-            pstmt.setString(3, programId);
-            ResultSet rs = pstmt.executeQuery();
-            rs.next();
-            return rs.getInt(1) == 0;
-        }
-    }
-
-    private static void insertTimetableEntry(Connection conn, String programId, String courseId, String... slots) throws SQLException {
-        for (String slot : slots) {
-            String day = slot.split(":")[0];
-            int period = Integer.parseInt(slot.split(":")[1]);
-            String facultyId = assignFaculty(conn, day, period);
-            String classroomId = assignClassroom(conn);
-            try (PreparedStatement pstmt = conn.prepareStatement(
-                    "INSERT INTO Timetable (program_id, day, period, course_id, faculty_id, classroom_id) VALUES (?, ?, ?, ?, ?, ?)")) {
-                pstmt.setString(1, programId);
-                pstmt.setString(2, day);
-                pstmt.setInt(3, period);
-                pstmt.setString(4, courseId);
-                pstmt.setString(5, facultyId);
-                pstmt.setString(6, classroomId);
-                pstmt.executeUpdate();
-            }
-        }
-    }
-
-    private static String assignFaculty(Connection conn, String day, int period) throws SQLException {
-        try (PreparedStatement pstmt = conn.prepareStatement(
-                "SELECT faculty_id FROM Faculty WHERE faculty_id NOT IN " +
-                        "(SELECT faculty_id FROM Timetable WHERE day = ? AND period = ?) LIMIT 1")) {
-            pstmt.setString(1, day);
-            pstmt.setInt(2, period);
-            ResultSet rs = pstmt.executeQuery();
-            if (rs.next()) {
-                return rs.getString("faculty_id");
-            }
-            throw new RuntimeException("No faculty available for " + day + " period " + period);
-        }
-    }
-
-    private static String assignClassroom(Connection conn) throws SQLException {
-        try (Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT classroom_id FROM Classrooms LIMIT 1")) {
-            if (rs.next()) {
-                return rs.getString("classroom_id");
-            }
-            throw new RuntimeException("No classroom available.");
-        }
-    }
-
-    private static void scheduleAdditionalSessions(String programId, Connection conn) throws SQLException {
-        List<String> additionalSessions = Arrays.asList("LIB", "MENT", "APT");
-        for (String sessionId : additionalSessions) {
-            // Check if the session_id already exists
-            try (PreparedStatement checkStmt = conn.prepareStatement(
-                    "SELECT COUNT(*) FROM AdditionalSessions WHERE session_id = ?")) {
-                checkStmt.setString(1, sessionId);
-                ResultSet rs = checkStmt.executeQuery();
-                rs.next();
-                if (rs.getInt(1) == 0) {
-                    // Insert the additional session
-                    try (PreparedStatement insertStmt = conn.prepareStatement(
-                            "INSERT INTO AdditionalSessions (session_id, session_name) VALUES (?, ?)")) {
-                        insertStmt.setString(1, sessionId);
-                        insertStmt.setString(2, getSessionName(sessionId));
-                        insertStmt.executeUpdate();
-                    }
-                }
-            }
-        }
-    }
-
-    private static String getSessionName(String sessionId) {
-        switch (sessionId) {
-            case "LIB":
-                return "Library";
-            case "MENT":
-                return "Mentoring";
-            case "APT":
-                return "Aptitude Training";
-            default:
-                return "Unknown";
-        }
+        return null;  // No available slots for the lab
     }
 
     private static boolean isGeneralElective(String courseId) {
-        // Assuming course IDs for General Electives are predefined or marked
         return courseId.startsWith("GE");
     }
 
     private static void allocateGESessions(Connection conn, String programId, String courseId) throws SQLException {
-        String[] geDays = {"Monday", "Wednesday"};
-        int[] gePeriods = {5, 6};
+        try (PreparedStatement pstmt = conn.prepareStatement(
+                "INSERT INTO Timetable (program_id, course_id, day, period) VALUES (?, ?, ?, ?)")) {
+            pstmt.setString(1, programId);
+            pstmt.setString(2, courseId);
 
-        for (String day : geDays) {
-            for (int period : gePeriods) {
-                try (PreparedStatement pstmt = conn.prepareStatement(
-                        "INSERT INTO Timetable (program_id, day, period, course_id, faculty_id, classroom_id) VALUES (?, ?, ?, ?, ?, ?)")) {
-                    pstmt.setString(1, programId);
-                    pstmt.setString(2, day);
-                    pstmt.setInt(3, period);
-                    pstmt.setString(4, courseId);
-                    pstmt.setString(5, "GE_FACULTY");
-                    pstmt.setString(6, "M400");
-                    pstmt.executeUpdate();
-                }
+            // Allocate Monday 5th and 6th period
+            pstmt.setString(3, "Monday");
+            pstmt.setInt(4, 5);
+            pstmt.executeUpdate();
+            pstmt.setString(3, "Monday");
+            pstmt.setInt(4, 6);
+            pstmt.executeUpdate();
+
+            // Allocate Wednesday 5th and 6th period
+            pstmt.setString(3, "Wednesday");
+            pstmt.setInt(4, 5);
+            pstmt.executeUpdate();
+            pstmt.setString(3, "Wednesday");
+            pstmt.setInt(4, 6);
+            pstmt.executeUpdate();
+            logger.info("GE sessions allocated for course: " + courseId);
+        }
+    }
+
+
+    private static boolean isSlotAvailable(Connection conn, String day, int period, String programId, String courseId) throws SQLException {
+        return !isSlotFilled(conn, day, period, programId);  // Modify this to add more logic for availability if required
+    }
+
+    private static void insertTimetableEntry(Connection conn, String programId, String courseId, String... slot) throws SQLException {
+        for (String slots : slot) {
+            String[] parts = slots.split(":");
+            String day = parts[0];
+            int period = Integer.parseInt(parts[1]);
+
+            String insertSQL = "INSERT INTO Timetable (program_id, course_id, day, period) VALUES (?, ?, ?, ?)";
+            try (PreparedStatement pstmt = conn.prepareStatement(insertSQL)) {
+                pstmt.setString(1, programId);
+                pstmt.setString(2, courseId);
+                pstmt.setString(3, day);
+                pstmt.setInt(4, period);
+                pstmt.executeUpdate();
+                logger.info("Timetable entry inserted: " + programId + ", " + courseId + ", " + day + ", " + period);
             }
         }
     }
 
     public static void main(String[] args) {
+        String programId = "MSCS";  // Example program ID
         try {
-            generateTimetable("MCAB");  // Example program ID
+            generateTimetable(programId);
         } catch (SQLException e) {
-            e.printStackTrace();
+            logger.log(Level.SEVERE, "Error generating timetable", e);
         }
+        System.out.println("hii");
+
+        try {
+            TimetableDisplay.displayTimetable();
+        } catch (SQLException e) {
+            logger.log(Level.SEVERE, "Error Displaying timetable", e);
+        }
+
     }
 }
